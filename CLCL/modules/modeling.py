@@ -15,6 +15,11 @@ from torch.nn.utils.rnn import pad_packed_sequence, pack_padded_sequence
 
 logger = logging.getLogger(__name__)
 allgather = AllGather.apply
+import pdb
+from .PDE import DisTrans
+from sklearn.manifold import TSNE
+import matplotlib.pyplot as plt
+import numpy as np
 
 class CLIP4ClipPreTrainedModel(PreTrainedModel, nn.Module):
     """ An abstract class to handle weights initialization and
@@ -247,6 +252,13 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
         self.loss_fct = CrossEn()
 
         self.apply(self.init_weights)
+        # weighted
+        self.text_weight_fc = nn.Sequential(
+            nn.Linear(transformer_width, transformer_width), nn.ReLU(inplace=True),
+            nn.Linear(transformer_width, 1))
+        self.video_weight_fc = nn.Sequential(
+            nn.Linear(transformer_width, transformer_width), nn.ReLU(inplace=True),
+            nn.Linear(transformer_width, 1))
 
     def forward(self, input_ids, token_type_ids, attention_mask, video, video_mask=None,input_ids_aug=None,attention_mask_aug=None,video_type='feature'):
         alpha=self.alpha
@@ -254,9 +266,10 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
         input_ids_aug = input_ids_aug.view(-1, input_ids.shape[-1])
 
         token_type_ids = token_type_ids.view(-1, token_type_ids.shape[-1])
-        attention_mask = attention_mask.view(-1, attention_mask.shape[-1])
+        attention_mask = attention_mask.view(-1, attention_mask.shape[-1])    # attention_mask = attention_mask_aug
         attention_mask_aug=attention_mask_aug.view(-1, attention_mask.shape[-1])
         #video_mask = video_mask.view(-1, video_mask.shape[-1])
+        logit_scale = self.clip.logit_scale.exp()
 
         # T x 3 x H x W
         if video_type!='feature':
@@ -266,20 +279,31 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
             video_frame = bs * ts
         else:
             video_frame = -1
-        sequence_hidden,text_mask,sequence_cls, visual_output,video_mask,visual_cls,sequence_hidden_aug,text_mask_aug,sequence_cls_aug= self.get_sequence_visual_output(input_ids, token_type_ids, attention_mask,
+        text_feat,text_mask,sequence_cls, video_feat,video_mask,visual_cls,text_feat_aug,text_mask_aug,sequence_cls_aug= self.get_text_video_feat(input_ids, token_type_ids, attention_mask,
                                                                          video, video_mask, shaped=True, video_frame=video_frame,input_ids_aug=input_ids_aug,attention_mask_aug=attention_mask_aug)
-
+        
         if self.training:
             loss = 0.
+            if self.distributed:
+                video_feat = allgather(video_feat, self.task_config)
+                video_mask = allgather(video_mask, self.task_config)
+
+                text_feat = allgather(text_feat, self.task_config)
+                text_feat_aug = allgather(text_feat_aug, self.task_config)
+                text_mask = allgather(text_mask, self.task_config)
+                text_mask_aug=allgather(text_mask_aug, self.task_config)
+                torch.distributed.barrier()
 
             if self.sim_header == "Filip":
-                I2T_sim, T2I_sim, *_tmp = self.get_similarity_logits(sequence_hidden, visual_output, text_mask,
+                I2T_sim, T2I_sim, *_tmp = self.get_similarity_logits(text_feat, video_feat, text_mask,
                                                                      video_mask,
-                                                                     shaped=True, loose_type=self.loose_type,sequence_hidden_aug=sequence_hidden_aug,text_mask_aug=text_mask_aug)
-                # sim_i2t = self.filp_cls_loose_similarity(sequence_cls, visual_cls, attention_mask,
-                #                                                      video_mask)
+                                                                     shaped=True, loose_type=self.loose_type,text_feat_aug=text_feat_aug,text_mask_aug=text_mask_aug)
+                # # sim_i2t = self.filp_cls_loose_similarity(sequence_cls, visual_cls, attention_mask,
+                # #                                                      video_mask)
+                
+
                 sim_loss1 = self.loss_fct(I2T_sim)
-                sim_loss2 = self.loss_fct(T2I_sim.T)
+                sim_loss2 = self.loss_fct(T2I_sim.T) # a b
                 batch=I2T_sim.shape[0]
                 # sim_loss=sim_loss1
                 if self.dual_mix!=1:
@@ -292,23 +316,23 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
                 else:
                     loss_cons=0
                 sim_loss = (sim_loss1 + sim_loss2) / 2
-                loss += sim_loss
+                loss += sim_loss  
             return loss
         else:
             return None
 
-    def get_loss(self,sequence_output,visual_output,attention_mask, video_mask):
+    def get_loss(self,text_feat,video_feat,text_mask, video_mask):
         loss = 0.
 
         if self.sim_header=="Filip":
-            I2T_sim,T2I_sim, *_tmp = self.get_similarity_logits(sequence_output, visual_output, attention_mask, video_mask,
+            I2T_sim,T2I_sim, *_tmp = self.get_similarity_logits(text_feat, video_feat, text_mask, video_mask,
                                                            shaped=True, loose_type=self.loose_type)
             sim_loss1 = self.loss_fct(I2T_sim)
             sim_loss2 = self.loss_fct(T2I_sim.transpose())
             sim_loss = (sim_loss1 + sim_loss2) / 2
             loss += sim_loss
 
-        sim_matrix, *_tmp = self.get_similarity_logits(sequence_output, visual_output, attention_mask, video_mask,
+        sim_matrix, *_tmp = self.get_similarity_logits(text_feat, video_feat, text_mask, video_mask,
                                                        shaped=True, loose_type=self.loose_type)
         sim_loss1 = self.loss_fct(sim_matrix.T)
         sim_loss2 = self.loss_fct(sim_matrix)
@@ -316,7 +340,7 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
         loss += sim_loss
         return loss
 
-    def get_sequence_output(self, input_ids, token_type_ids, attention_mask, shaped=False,get_hidden=True):
+    def get_text_feat(self, input_ids, token_type_ids, attention_mask, shaped=False,get_hidden=True):
         if shaped is False:
             input_ids = input_ids.view(-1, input_ids.shape[-1])
             token_type_ids = token_type_ids.view(-1, token_type_ids.shape[-1])
@@ -335,7 +359,7 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
 
         return sequence_hidden
 
-    def get_visual_output(self, video, video_mask, shaped=True, video_frame=-1,get_hidden=True):
+    def get_video_feat(self, video, video_mask, shaped=True, video_frame=-1,get_hidden=True):
         if shaped is False:
             video_mask = video_mask.view(-1, video_mask.shape[-1])
             video = torch.as_tensor(video).float()
@@ -359,7 +383,7 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
 
         return video_mask,visual_hidden,visual_cls
 
-    def get_sequence_visual_output(self, input_ids, token_type_ids, attention_mask, video, video_mask, shaped=False, video_frame=-1,input_ids_aug=None,attention_mask_aug=None):
+    def get_text_video_feat(self, input_ids, token_type_ids, attention_mask, video, video_mask, shaped=False, video_frame=-1,input_ids_aug=None,attention_mask_aug=None):
         if shaped is False:
             input_ids = input_ids.view(-1, input_ids.shape[-1])
             token_type_ids = token_type_ids.view(-1, token_type_ids.shape[-1])
@@ -372,16 +396,16 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
             video_frame = bs * ts
         video_frame=1
 
-        text_mask,sequence_hidden,sequence_cls = self.get_sequence_output(input_ids,  token_type_ids, attention_mask, shaped=False)
-        text_mask_aug,sequence_hidden_aug,sequence_cls_aug = self.get_sequence_output(input_ids_aug,  token_type_ids, attention_mask_aug, shaped=False)
+        text_mask,sequence_hidden,sequence_cls = self.get_text_feat(input_ids,  token_type_ids, attention_mask, shaped=False)
+        text_mask_aug,text_feat_aug,sequence_cls_aug = self.get_text_feat(input_ids_aug,  token_type_ids, attention_mask_aug, shaped=False)
 
-        video_mask,visual_output,visual_cls = self.get_visual_output(video, video_mask, shaped=True, video_frame=video_frame)
+        video_mask,video_feat,visual_cls = self.get_video_feat(video, video_mask, shaped=True, video_frame=video_frame)
 
-        return sequence_hidden,text_mask,sequence_cls, visual_output,video_mask,visual_cls,sequence_hidden_aug,text_mask_aug,sequence_cls_aug
+        return sequence_hidden,text_mask,sequence_cls, video_feat,video_mask,visual_cls,text_feat_aug,text_mask_aug,sequence_cls_aug
 
-    def _get_cross_output(self, sequence_output, visual_output, attention_mask, video_mask):
+    def _get_cross_output(self, text_feat, video_feat, attention_mask, video_mask):
 
-        concat_features = torch.cat((sequence_output, visual_output), dim=1)  # concatnate tokens and frames
+        concat_features = torch.cat((text_feat, video_feat), dim=1)  # concatnate tokens and frames
         concat_mask = torch.cat((attention_mask, video_mask), dim=1)
         text_type_ = torch.zeros_like(attention_mask)
         video_type_ = torch.ones_like(video_mask)
@@ -392,29 +416,48 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
 
         return cross_output, pooled_output, concat_mask
 
-    def _mean_pooling_for_similarity_sequence(self, sequence_output, attention_mask):
-        attention_mask_un = attention_mask.to(dtype=torch.float).unsqueeze(-1)
-        attention_mask_un[:, 0, :] = 0.
-        sequence_output = sequence_output * attention_mask_un
-        text_out = torch.sum(sequence_output, dim=1) / torch.sum(attention_mask_un, dim=1, dtype=torch.float)
-        return text_out
+    # def _mean_pooling_for_similarity_sequence(self, text_feat, attention_mask):
+    #     attention_mask_un = attention_mask.to(dtype=torch.float).unsqueeze(-1)
+    #     attention_mask_un[:, 0, :] = 0.
+    #     text_feat = text_feat * attention_mask_un
+    #     text_out = torch.sum(text_feat, dim=1) / torch.sum(attention_mask_un, dim=1, dtype=torch.float)
+    #     return text_out
 
-    def _mean_pooling_for_similarity_visual(self, visual_output, video_mask,):
+    # def _mean_pooling_for_similarity_visual(self, video_feat, video_mask,):
+    #     video_mask_un = video_mask.to(dtype=torch.float).unsqueeze(-1)
+    #     video_feat = video_feat * video_mask_un
+    #     video_mask_un_sum = torch.sum(video_mask_un, dim=1, dtype=torch.float)
+    #     video_mask_un_sum[video_mask_un_sum == 0.] = 1.
+    #     video_out = torch.sum(video_feat, dim=1) / video_mask_un_sum
+    #     return video_out
+
+    def _mean_pooling_for_similarity_sequence(self, text_feat, text_mask):
+        text_mask_un = text_mask.to(dtype=torch.float).unsqueeze(-1)
+        if text_feat.dim()>3:
+            text_mask_un = text_mask_un.unsqueeze(-1)
+        text_mask_un[:, 0, :] = 0.
+        text_feat = text_feat * text_mask_un
+        text_out = torch.sum(text_feat, dim=1) / torch.sum(text_mask_un, dim=1, dtype=torch.float)
+        return text_out
+    
+    def _mean_pooling_for_similarity_visual(self, video_feat, video_mask,):
         video_mask_un = video_mask.to(dtype=torch.float).unsqueeze(-1)
-        visual_output = visual_output * video_mask_un
+        if video_feat.dim()>3:
+            video_mask_un = video_mask_un.unsqueeze(-1)
+        video_feat = video_feat * video_mask_un
         video_mask_un_sum = torch.sum(video_mask_un, dim=1, dtype=torch.float)
         video_mask_un_sum[video_mask_un_sum == 0.] = 1.
-        video_out = torch.sum(visual_output, dim=1) / video_mask_un_sum
+        video_out = torch.sum(video_feat, dim=1) / video_mask_un_sum
         return video_out
 
-    def _mean_pooling_for_similarity(self, sequence_output, visual_output, attention_mask, video_mask,):
-        text_out = self._mean_pooling_for_similarity_sequence(sequence_output, attention_mask)
-        video_out = self._mean_pooling_for_similarity_visual(visual_output, video_mask)
+    def _mean_pooling_for_similarity(self, text_feat, video_feat, attention_mask, video_mask,):
+        text_out = self._mean_pooling_for_similarity_sequence(text_feat, attention_mask)
+        video_out = self._mean_pooling_for_similarity_visual(video_feat, video_mask)
 
         return text_out, video_out
 
-    def _loose_similarity(self, sequence_output, visual_output, attention_mask, video_mask, sim_header="meanP"):
-        sequence_output, visual_output = sequence_output.contiguous(), visual_output.contiguous()
+    def _loose_similarity(self, text_feat, video_feat, attention_mask, video_mask, sim_header="meanP"):
+        text_feat, video_feat = text_feat.contiguous(), video_feat.contiguous()
 
         if sim_header == "meanP":
             # Default: Parameter-free type
@@ -422,103 +465,108 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
 
         elif sim_header == "seqLSTM":
             # Sequential type: LSTM
-            visual_output_original = visual_output
-            visual_output = pack_padded_sequence(visual_output, torch.sum(video_mask, dim=-1).cpu(),
+            video_feat_original = video_feat
+            video_feat = pack_padded_sequence(video_feat, torch.sum(video_mask, dim=-1).cpu(),
                                                  batch_first=True, enforce_sorted=False)
-            visual_output, _ = self.lstm_visual(visual_output)
+            video_feat, _ = self.lstm_visual(video_feat)
             if self.training: self.lstm_visual.flatten_parameters()
-            visual_output, _ = pad_packed_sequence(visual_output, batch_first=True)
-            visual_output = torch.cat((visual_output, visual_output_original[:, visual_output.size(1):, ...].contiguous()), dim=1)
-            visual_output = visual_output + visual_output_original
+            video_feat, _ = pad_packed_sequence(video_feat, batch_first=True)
+            video_feat = torch.cat((video_feat, video_feat_original[:, video_feat.size(1):, ...].contiguous()), dim=1)
+            video_feat = video_feat + video_feat_original
         elif sim_header == "seqTransf":
             # Sequential type: Transformer Encoder
-            visual_output_original = visual_output
-            seq_length = visual_output.size(1)
-            position_ids = torch.arange(seq_length, dtype=torch.long, device=visual_output.device)
-            position_ids = position_ids.unsqueeze(0).expand(visual_output.size(0), -1)
+            video_feat_original = video_feat
+            seq_length = video_feat.size(1)
+            position_ids = torch.arange(seq_length, dtype=torch.long, device=video_feat.device)
+            position_ids = position_ids.unsqueeze(0).expand(video_feat.size(0), -1)
             frame_position_embeddings = self.frame_position_embeddings(position_ids)
-            visual_output = visual_output + frame_position_embeddings
+            video_feat = video_feat + frame_position_embeddings
 
             extended_video_mask = (1.0 - video_mask.unsqueeze(1)) * -1000000.0
             extended_video_mask = extended_video_mask.expand(-1, video_mask.size(1), -1)
-            visual_output = visual_output.permute(1, 0, 2)  # NLD -> LND
-            visual_output = self.transformerClip(visual_output, extended_video_mask)
-            visual_output = visual_output.permute(1, 0, 2)  # LND -> NLD
-            visual_output = visual_output + visual_output_original
+            video_feat = video_feat.permute(1, 0, 2)  # NLD -> LND
+            video_feat = self.transformerClip(video_feat, extended_video_mask)
+            video_feat = video_feat.permute(1, 0, 2)  # LND -> NLD
+            video_feat = video_feat + video_feat_original
 
         if self.training and self.distributed:
-            visual_output = allgather(visual_output, self.task_config)
+            video_feat = allgather(video_feat, self.task_config)
             video_mask = allgather(video_mask, self.task_config)
-            sequence_output = allgather(sequence_output, self.task_config)
+            text_feat = allgather(text_feat, self.task_config)
             torch.distributed.barrier()
 
-        visual_output = visual_output / visual_output.norm(dim=-1, keepdim=True)
-        visual_output = visual_output.squeeze(1)
+        video_feat = video_feat / video_feat.norm(dim=-1, keepdim=True)
+        video_feat = video_feat.squeeze(1)
 
 
-        sequence_output = sequence_output.squeeze(1)
-        sequence_output = sequence_output / sequence_output.norm(dim=-1, keepdim=True)
+        text_feat = text_feat.squeeze(1)
+        text_feat = text_feat / text_feat.norm(dim=-1, keepdim=True)
 
         logit_scale = self.clip.logit_scale.exp()
-        retrieve_logits = logit_scale * torch.matmul(sequence_output, visual_output.t())
+        retrieve_logits = logit_scale * torch.matmul(text_feat, video_feat.t())
         return retrieve_logits
 
 
 
-    def flip_similarity_softmax(self, sequence_output, visual_output, attention_mask, video_mask, sim_header="meanP",pad_type=1,sequence_hidden_aug=None,text_mask_aug=None):
-
-        if self.training and self.distributed:
-            visual_output = allgather(visual_output, self.task_config)
-
-            video_mask = allgather(video_mask, self.task_config)
-
-            sequence_output = allgather(sequence_output, self.task_config)
-            sequence_hidden_aug = allgather(sequence_hidden_aug, self.task_config)
-            attention_mask = allgather(attention_mask, self.task_config)
-            text_mask_aug=allgather(text_mask_aug, self.task_config)
-            torch.distributed.barrier()
+    def flip_similarity_softmax(self, text_feat, video_feat, text_mask, video_mask, sim_header="meanP",pad_type=1,text_feat_aug=None,text_mask_aug=None):
+    
         video_mask = (video_mask == 0)
-        attention_mask=(attention_mask==1)
+        text_mask=(text_mask==1)
         text_mask_aug=(text_mask_aug==1)
 
-        visual_output = visual_output / visual_output.norm(dim=-1, keepdim=True)
-        visual_output = visual_output.squeeze(1)
+        batch_size,v_len=video_feat.shape[0],video_feat.shape[1]
+        batch_size_t,t_len=text_feat.shape[0],text_feat.shape[1]
 
-        sequence_output = sequence_output / sequence_output.norm(dim=-1, keepdim=True)
-        sequence_output = sequence_output.squeeze(1)
+        # weighted
+        #pdb.set_trace()
+        text_weight,video_weight = None,None
+        
 
-        batch_size,v_len=visual_output.shape[0],visual_output.shape[1]
-        batch_size_t,t_len=sequence_output.shape[0],sequence_output.shape[1]
+        text_weight = self.text_weight_fc(text_feat_aug).squeeze(2)
+        video_weight = self.video_weight_fc(video_feat).squeeze(2)
 
-        sequence_hidden_aug = sequence_hidden_aug / sequence_hidden_aug.norm(dim=-1, keepdim=True)
-        sequence_hidden_aug = sequence_hidden_aug.squeeze(1)
+        text_weight.masked_fill_((~text_mask_aug),float("-inf"))
+        video_weight.masked_fill_((~video_mask),float("-inf"))
+        text_weight = torch.softmax(text_weight,dim=-1)
+        video_weight = torch.softmax(video_weight,dim=-1)
+
+        video_feat = video_feat / video_feat.norm(dim=-1, keepdim=True)
+        video_feat = video_feat.squeeze(1)
+
+        text_feat = text_feat / text_feat.norm(dim=-1, keepdim=True)
+        text_feat = text_feat.squeeze(1)
+
+        text_feat_aug = text_feat_aug / text_feat_aug.norm(dim=-1, keepdim=True)
+        text_feat_aug = text_feat_aug.squeeze(1)
 
 
         logit_scale = self.clip.logit_scale.exp()
-        i2t_sim=torch.einsum("ais,bjs->abij", [visual_output, sequence_output])
-        i2t_sim_aug=torch.einsum("ais,bjs->abij", [visual_output, sequence_hidden_aug])
+        i2t_sim=torch.einsum("ais,bjs->abij", [video_feat, text_feat])
+        i2t_sim_aug=torch.einsum("ais,bjs->abij", [video_feat, text_feat_aug])
 
-        after_softmax_i2t = torch.nansum(i2t_sim * torch.softmax(i2t_sim/0.07, dim=3), dim=3)
-        video_mask_extend=video_mask.unsqueeze(1).repeat(1,batch_size_t,1)
-        after_softmax_i2t[~video_mask_extend]=0
-        I2T_sim = logit_scale*torch.nansum(after_softmax_i2t, dim=-1)/torch.sum(video_mask_extend,dim=-1)
+        after_softmax_i2t = torch.nansum(i2t_sim * torch.softmax(i2t_sim/0.07, dim=3), dim=3) 
+        #after_softmax_i2t1 = torch.nansum(i2t_sim * torch.softmax(i2t_sim/0.07, dim=3), dim=3)
+  
+        I2T_sim = torch.einsum("abi,ai->abi",[after_softmax_i2t,video_weight])
+        I2T_sim = torch.einsum("abi,ai->abi",[I2T_sim,video_mask])
+        I2T_sim = torch.einsum("abi->ab",I2T_sim)
+        
+        after_softmax_t2i = torch.nansum(i2t_sim_aug * torch.softmax(i2t_sim_aug/0.07, dim=2), dim=2) 
+        T2I_sim = torch.einsum("abj,bj->abj",[after_softmax_t2i,text_weight])
+        T2I_sim = torch.einsum("abj,bj->abj",[T2I_sim,text_mask_aug])
+        T2I_sim= torch.einsum("abj->ab",T2I_sim)
+     
+        if self.training:
+            return (I2T_sim * logit_scale) ,(T2I_sim * logit_scale) + 
+        else:
+            return I2T_sim,T2I_sim
 
 
-        after_softmax_t2i = torch.nansum(i2t_sim_aug * torch.softmax(i2t_sim_aug/0.07, dim=2), dim=2)
-        text_mask_extend2=text_mask_aug.unsqueeze(0).repeat(batch_size,1,1)
-        after_softmax_t2i[~text_mask_extend2]=0
+    def _cross_similarity(self, text_feat, video_feat, attention_mask, video_mask):
+        text_feat, video_feat = text_feat.contiguous(), video_feat.contiguous()
 
-        T2I_sim = logit_scale*torch.nansum(after_softmax_t2i*text_mask_extend2, dim=-1)/torch.sum(text_mask_extend2,dim=-1)
-
-
-        return I2T_sim,T2I_sim
-
-
-    def _cross_similarity(self, sequence_output, visual_output, attention_mask, video_mask):
-        sequence_output, visual_output = sequence_output.contiguous(), visual_output.contiguous()
-
-        b_text, s_text, h_text = sequence_output.size()
-        b_visual, s_visual, h_visual = visual_output.size()
+        b_text, s_text, h_text = text_feat.size()
+        b_visual, s_visual, h_visual = video_feat.size()
 
         retrieve_logits_list = []
 
@@ -529,27 +577,27 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
             split_size += [release_size]
 
         # due to clip text branch retrun the last hidden
-        attention_mask = torch.ones(sequence_output.size(0), 1)\
+        attention_mask = torch.ones(text_feat.size(0), 1)\
             .to(device=attention_mask.device, dtype=attention_mask.dtype)
 
-        sequence_output_splits = torch.split(sequence_output, split_size, dim=0)
+        text_feat_splits = torch.split(text_feat, split_size, dim=0)
         attention_mask_splits = torch.split(attention_mask, split_size, dim=0)
         for i in range(len(split_size)):
-            sequence_output_row = sequence_output_splits[i]
+            text_feat_row = text_feat_splits[i]
             attention_mask_row = attention_mask_splits[i]
-            sequence_output_l = sequence_output_row.unsqueeze(1).repeat(1, b_visual, 1, 1)
-            sequence_output_l = sequence_output_l.view(-1, s_text, h_text)
+            text_feat_l = text_feat_row.unsqueeze(1).repeat(1, b_visual, 1, 1)
+            text_feat_l = text_feat_l.view(-1, s_text, h_text)
             attention_mask_l = attention_mask_row.unsqueeze(1).repeat(1, b_visual, 1)
             attention_mask_l = attention_mask_l.view(-1, s_text)
 
-            step_truth = sequence_output_row.size(0)
-            visual_output_r = visual_output.unsqueeze(0).repeat(step_truth, 1, 1, 1)
-            visual_output_r = visual_output_r.view(-1, s_visual, h_visual)
+            step_truth = text_feat_row.size(0)
+            video_feat_r = video_feat.unsqueeze(0).repeat(step_truth, 1, 1, 1)
+            video_feat_r = video_feat_r.view(-1, s_visual, h_visual)
             video_mask_r = video_mask.unsqueeze(0).repeat(step_truth, 1, 1)
             video_mask_r = video_mask_r.view(-1, s_visual)
 
             cross_output, pooled_output, concat_mask = \
-                self._get_cross_output(sequence_output_l, visual_output_r, attention_mask_l, video_mask_r)
+                self._get_cross_output(text_feat_l, video_feat_r, attention_mask_l, video_mask_r)
             retrieve_logits_row = self.similarity_dense(pooled_output).squeeze(-1).view(step_truth, b_visual)
 
             retrieve_logits_list.append(retrieve_logits_row)
@@ -557,26 +605,32 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
         retrieve_logits = torch.cat(retrieve_logits_list, dim=0)
         return retrieve_logits
 
-    def get_similarity_logits(self, sequence_output,visual_output, attention_mask, video_mask, shaped=False, loose_type=False,is_train=True,sequence_hidden_aug=None,text_mask_aug=None):
+    def get_similarity_logits(self, text_feat,video_feat, text_mask, video_mask, shaped=False, loose_type=False,is_train=True,text_feat_aug=None,text_mask_aug=None):
         if shaped is False:
-            attention_mask = attention_mask.view(-1, attention_mask.shape[-1])
+            text_mask = text_mask.view(-1, text_mask.shape[-1])
             video_mask = video_mask.view(-1, video_mask.shape[-1])
 
+        #pdb.set_trace()
+        # if not self.training:
+        #     # self.get_vis(self._mean_pooling_for_similarity_sequence(text_feat,text_mask),
+        #     #              self._mean_pooling_for_similarity_visual(video_feat,video_mask))
+        #     self.get_vis(text_feat,video_feat,text_mask,video_mask)
+
         contrastive_direction = ()
-        if sequence_hidden_aug==None:
-            sequence_hidden_aug=sequence_output
-            text_mask_aug=attention_mask
+        if text_feat_aug==None:
+            text_feat_aug=text_feat
+            text_mask_aug=text_mask
         if self.sim_header=='Filip' and is_train==True:
 
-            I2T_sim,T2I_sim = self.flip_similarity_softmax(sequence_output, visual_output, attention_mask, video_mask,
-                                                     sim_header=self.sim_header,sequence_hidden_aug=sequence_hidden_aug,text_mask_aug=text_mask_aug)
+            I2T_sim,T2I_sim = self.flip_similarity_softmax(text_feat, video_feat, text_mask, video_mask,
+                                                     sim_header=self.sim_header,text_feat_aug=text_feat_aug,text_mask_aug=text_mask_aug)
 
             return I2T_sim,T2I_sim,contrastive_direction
         if loose_type:
             # assert self.sim_header in ["meanP", "seqLSTM", "seqTransf"]
-            retrieve_logits = self._loose_similarity(sequence_output, visual_output, attention_mask, video_mask, sim_header=self.sim_header)
+            retrieve_logits = self._loose_similarity(text_feat, video_feat, text_mask, video_mask, sim_header=self.sim_header)
         else:
             assert self.sim_header in ["tightTransf"]
-            retrieve_logits = self._cross_similarity(sequence_output, visual_output, attention_mask, video_mask, )
+            retrieve_logits = self._cross_similarity(text_feat, video_feat, text_mask, video_mask, )
 
         return retrieve_logits, contrastive_direction
